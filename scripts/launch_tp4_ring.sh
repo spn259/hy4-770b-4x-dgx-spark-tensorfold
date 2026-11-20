@@ -20,7 +20,7 @@ for r in 0 1 2 3; do
     LD_LIBRARY_PATH=\$HOME/nccl-2.30.7:/usr/local/cuda/lib64 \
     NCCL_COMM_ID=${RANK0_IP}:29551 \
     NCCL_SOCKET_IFNAME=${SOCKET_IF} \
-    NCCL_IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1 \
+    NCCL_IB_HCA=rocep1s0f0,rocep1s0f1 \
     NCCL_IB_SUBNET_AWARE_ROUTING=1 \
     NCCL_IB_SUBNET_PREFIX_LEN=24 \
     NCCL_ALGO=Ring \

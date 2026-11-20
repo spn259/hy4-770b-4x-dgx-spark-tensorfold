@@ -17,6 +17,7 @@ UPSTREAM = os.environ.get("HY4_UPSTREAM", "http://192.168.68.119:8895").rstrip("
 LISTEN_HOST = os.environ.get("HY4_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("HY4_PROXY_PORT", "8896"))
 DEFAULT_TEMP = os.environ.get("HY4_DEFAULT_TEMP", "")  # optional override, e.g. "0.3"
+THINKING_BUDGET = os.environ.get("HY4_THINKING_BUDGET", "")  # optional cap, e.g. "2048"
 UPSTREAM_LOCK = threading.Lock()
 
 OPEN_WRAP = "<tool_calls:opensource>"
@@ -120,6 +121,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = json.loads(raw)
         if DEFAULT_TEMP and "temperature" not in payload:
             payload["temperature"] = float(DEFAULT_TEMP)
+        if THINKING_BUDGET and "thinking_budget" not in payload:
+            payload["thinking_budget"] = int(THINKING_BUDGET)
         is_stream = bool(payload.get("stream", False))
         # Serialize /v1/chat/completions so single-stream Hy4 never rejects overlapping OMP requests
         with UPSTREAM_LOCK:
