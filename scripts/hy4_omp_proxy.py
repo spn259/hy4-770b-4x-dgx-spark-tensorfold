@@ -75,6 +75,98 @@ def longest_prefix_suffix(buf: str, marker: str) -> int:
     return 0
 
 
+STRIP_FIELDS = {
+    "store", "metadata", "user", "prompt_cache_key", "service_tier",
+    "prediction", "modalities", "audio", "parallel_tool_calls",
+    "guided_json", "guided_regex", "guided_choice", "guided_grammar",
+    "structured_outputs",
+}
+
+
+def normalize_payload(payload: dict) -> dict:
+    """Normalize OpenAI/OMP payloads so every prompt succeeds cleanly on TensorFold Hy4."""
+    p = dict(payload)
+    for k in STRIP_FIELDS:
+        p.pop(k, None)
+
+    extra_sys = []
+
+    # 1. Downgrade tool_choice="required" or named function (TensorFold CUDA has no token grammar)
+    tc = p.get("tool_choice")
+    if tc == "required":
+        p["tool_choice"] = "auto"
+        extra_sys.append("You MUST respond by calling one of the provided tools.")
+    elif isinstance(tc, dict):
+        fn = (tc.get("function") or {}).get("name") or tc.get("name")
+        p["tool_choice"] = "auto"
+        if fn:
+            extra_sys.append(f"You MUST call the tool named `{fn}`.")
+
+    # 2. Downgrade response_format (json_object / json_schema) to system instruction
+    rf = p.pop("response_format", None)
+    if isinstance(rf, dict):
+        rtype = rf.get("type")
+        if rtype == "json_object":
+            extra_sys.append("Respond with valid JSON only (no markdown fences or extra prose).")
+        elif rtype == "json_schema":
+            schema = (rf.get("json_schema") or {}).get("schema")
+            if schema:
+                extra_sys.append(f"Respond with valid JSON matching this schema only:\n{json.dumps(schema)}")
+            else:
+                extra_sys.append("Respond with valid JSON only.")
+
+    # 3. Normalize reasoning_effort to Hy4's supported modes (high vs no_think)
+    ctk = dict(p.get("chat_template_kwargs") or {})
+    re_val = p.pop("reasoning_effort", None)
+    if re_val is None:
+        re_val = ctk.get("reasoning_effort")
+    thinking_off = False
+    if isinstance(re_val, str):
+        rl = re_val.strip().lower()
+        if rl in ("none", "off", "no_think", "minimal", "low"):
+            ctk["reasoning_effort"] = "no_think"
+            ctk["enable_thinking"] = False
+            thinking_off = True
+        else:
+            ctk["reasoning_effort"] = "high"
+            ctk["enable_thinking"] = True
+    if ctk.get("enable_thinking") is False or ctk.get("reasoning_effort") in ("no_think", "none"):
+        thinking_off = True
+    if ctk:
+        p["chat_template_kwargs"] = ctk
+
+    # 4. Sanitize messages: flatten non-text multimodal parts (e.g. image_url) on text-only endpoint
+    msgs = []
+    for m in p.get("messages") or []:
+        m2 = dict(m)
+        content = m2.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
+                    parts.append({"type": "text", "text": "[image omitted: text-only model]"})
+                elif isinstance(part, str):
+                    parts.append({"type": "text", "text": part})
+            m2["content"] = parts if parts else ""
+        msgs.append(m2)
+    if extra_sys:
+        note = "\n".join(extra_sys)
+        if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
+            msgs[0]["content"] = msgs[0]["content"].rstrip() + "\n\n" + note
+        else:
+            msgs.insert(0, {"role": "system", "content": note})
+    p["messages"] = msgs
+
+    # 5. Defaults: temperature + thinking_budget (only when thinking is on)
+    if DEFAULT_TEMP and "temperature" not in p:
+        p["temperature"] = float(DEFAULT_TEMP)
+    if THINKING_BUDGET and not thinking_off and "thinking_budget" not in p:
+        p["thinking_budget"] = int(THINKING_BUDGET)
+    return p
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -118,11 +210,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
             return
 
-        payload = json.loads(raw)
-        if DEFAULT_TEMP and "temperature" not in payload:
-            payload["temperature"] = float(DEFAULT_TEMP)
-        if THINKING_BUDGET and "thinking_budget" not in payload:
-            payload["thinking_budget"] = int(THINKING_BUDGET)
+        payload = normalize_payload(json.loads(raw))
         is_stream = bool(payload.get("stream", False))
         # Serialize /v1/chat/completions so single-stream Hy4 never rejects overlapping OMP requests
         with UPSTREAM_LOCK:

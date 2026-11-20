@@ -416,7 +416,7 @@ index 237c9f4..1a961d0 100644
  
  const Layer = struct { attn: engine.Attn, in_norm: u64, post_norm: u64, gate_up: Lin, down: Lin, inter: usize, kv: usize };
 diff --git a/zig/src/families/hy4_flash/engine.zig b/zig/src/families/hy4_flash/engine.zig
-index cc06f8f..63c6fec 100644
+index cc06f8f..f0c0b01 100644
 --- a/zig/src/families/hy4_flash/engine.zig
 +++ b/zig/src/families/hy4_flash/engine.zig
 @@ -15,7 +15,7 @@ pub const row_width = 576;
@@ -428,7 +428,26 @@ index cc06f8f..63c6fec 100644
  const hc_eps: f32 = 1e-6;
  const hc_magnitude: f32 = 2.0;
  /// Engram's nn.RMSNorm(eps=None): the reference matches float32's eps (hy4-real-check).
-@@ -129,6 +129,8 @@ pub const Model = struct {
+@@ -82,7 +82,8 @@ pub const Snap = struct { layers: [8]usize, n: usize, tok: u64, cnt: u64, slot:
+ /// Graphs a chunk count holds: a decode row, a verify block, a DFly proposal (dense, or over the target's keys).
+ pub const graph_kinds = 4;
+ /// A captured step and where it leaves its result (logits, or DFly's draft ids) and its final-normed rows.
+-pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64, local: u64 };
++pub const ScratchPos = struct { block: usize = 0, at: usize = 0 };
++pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64, local: u64, used: ScratchPos };
+ 
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+@@ -99,7 +100,7 @@ pub const Model = struct {
+     weights: Bufs = .empty,
+     /// A step's buffers: blocks kept across steps, handed out from `used` (block, bytes) and taken back at reset.
+     scratch: Bufs = .empty,
+-    used: struct { block: usize = 0, at: usize = 0 } = .{},
++    used: ScratchPos = .{},
+     /// With `prof`: each part's synchronized time over the steps so far (ns): engram, attention, mlp, head.
+     prof: ?std.Io = null,
+     times: [8]i96 = @splat(0),
+@@ -129,6 +130,8 @@ pub const Model = struct {
      use_index: bool = true,
      /// DFly's view of the target's indexer: the last step's recalled lists for its draft layers' target layers.
      snap: ?Snap = null,
@@ -437,7 +456,31 @@ index cc06f8f..63c6fec 100644
      /// A check's copy of one layer's recalled groups ([rows][512] int64 at `probe`; 0: none).
      probe: u64 = 0,
      probe_layer: usize = 0,
-@@ -356,6 +358,7 @@ pub const Model = struct {
+@@ -273,7 +276,7 @@ pub const Model = struct {
+         try m.inputs(ids, p0);
+         const rows = if (last) 1 else n;
+         const kind: ?usize = if (n == 1 and last) 0 else if (n == verify_rows and !last) 1 else null;
+-        const toks = if (kind != null and m.use_graphs and m.prof == null and logits == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
++        const toks = if (kind != null and m.use_graphs and m.prof == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
+         if (m.snap) |*sn| sn.keys = p0 + n; // the step keepRow names next: its lists stand when it ran the indexer
+         try m.s.synchronize();
+         try cuda.memory.download(m.d, toks, std.mem.sliceAsBytes(out[0..rows]));
+@@ -335,12 +338,13 @@ pub const Model = struct {
+             defer g.deinit();
+             const exec = try g.instantiate();
+             try exec.upload(m.s);
+-            m.graphs[key] = .{ .exec = exec, .logits = out, .hn = m.hn, .local = m.local };
++            m.graphs[key] = .{ .exec = exec, .logits = out, .hn = m.hn, .local = m.local, .used = m.used };
+         }
+         const g = m.graphs[key].?;
+         try g.exec.launchOn(m.s);
+         m.hn = g.hn;
+         m.local = g.local;
++        m.used = g.used;
+         return g;
+     }
+ 
+@@ -356,6 +360,7 @@ pub const Model = struct {
          const pos_h = [2]i32{ @intCast(p0), @intCast(p0 + 3) };
          try view(m, m.pos, 4).upload(0, std.mem.sliceAsBytes(pos_h[0..1]));
          try view(m, m.pos3, 4).upload(0, std.mem.sliceAsBytes(pos_h[1..2]));
@@ -445,7 +488,7 @@ index cc06f8f..63c6fec 100644
          const hash = try m.gpa.alloc(i32, n * engram.heads);
          defer m.gpa.free(hash);
          const toks = m.tokens.items;
-@@ -402,6 +405,10 @@ pub const Model = struct {
+@@ -402,6 +407,10 @@ pub const Model = struct {
          errdefer std.log.err("hy4 step: failed in layer {d}'s {s} ({d} rows at {d})", .{ at, stage, n, p0 });
          var t: i96 = if (m.prof) |io| std.Io.Clock.awake.now(io).toNanoseconds() else 0;
          try m.mark(3, &t);
@@ -456,7 +499,7 @@ index cc06f8f..63c6fec 100644
          const kept = m.used; // a layer's scratch is taken back at its end: a step holds one layer's at a time
          for (m.layers, 0..) |*L, i| {
              m.used = kept;
-@@ -478,7 +485,9 @@ pub const Model = struct {
+@@ -478,7 +487,9 @@ pub const Model = struct {
          const win: usize = c.window;
          const recall: usize = c.index_topk; // the indexer runs once the keys outgrow it
          if (a.idx) |ix| try index.keys(m, ix, x, pos, a.inv_freq, n);
@@ -467,7 +510,7 @@ index cc06f8f..63c6fec 100644
          const nch: usize = if (list) |li| (li.w + 511) / 512 else if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
          const part: cuda.mla.Partials = .{ .po = try m.zeros(nch * n * H * 512 * 4), .pm = try m.zeros(nch * n * H * 4), .pl = try m.zeros(nch * n * H * 4) };
          const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sparse.nope + c.sparse.rope)));
-@@ -489,6 +498,9 @@ pub const Model = struct {
+@@ -489,6 +500,9 @@ pub const Model = struct {
              const cnt = try m.buf(n * 4);
              try k.window(m.s, pos, tok, cnt, n, win);
              try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, tok, cnt, win, part, n, H, scale);
@@ -477,7 +520,7 @@ index cc06f8f..63c6fec 100644
          } else if (indexed) {
              const tok = try m.buf(n * recall * 4);
              const cnt = try m.buf(n * 4);
-@@ -509,7 +521,7 @@ pub const Model = struct {
+@@ -509,7 +523,7 @@ pub const Model = struct {
          try m.proj(a.o, o, H * 256, po, n);
          try m.sum(po, n * hd);
          const out = try m.buf(n * hd * 2);
@@ -486,7 +529,7 @@ index cc06f8f..63c6fec 100644
          return out;
      }
  
-@@ -518,7 +530,8 @@ pub const Model = struct {
+@@ -518,7 +532,8 @@ pub const Model = struct {
          var t = t_;
          if (skip >= 0) t.experts += 1; // the other ranks' picks, planned as one more expert and skipped
          const pairs = n * per;
@@ -496,7 +539,7 @@ index cc06f8f..63c6fec 100644
          const items = cuda.grouped.maxItems(pairs, t.experts, tile);
          const wide = pairs > cuda.grouped.small;
          const plan: cuda.grouped.Plan = .{ .members = try m.zeros(pairs * 4), .items = try m.zeros(items * 12), .counts = try m.zeros(8), .rank = try m.zeros((if (wide) pairs else 1) * 4), .hist = try m.zeros((if (wide) (pairs + 1023) / 1024 * t.experts else 1) * 4) };
-@@ -526,8 +539,13 @@ pub const Model = struct {
+@@ -526,8 +541,13 @@ pub const Model = struct {
          const act = try m.buf(pairs * t.width * 2);
          const y = try m.zeros(pairs * t.dims * 2);
          const g: cuda.experts.Grouped = .{ .nvfp4 = &m.k.x };
@@ -512,7 +555,7 @@ index cc06f8f..63c6fec 100644
          const out = try m.buf(n * t.dims * 2);
          try m.k.glue.combine(m.s, y, .bf16, wts, out, .bf16, n, per, t.dims);
          return out;
-@@ -547,7 +565,7 @@ pub const Model = struct {
+@@ -547,7 +567,7 @@ pub const Model = struct {
                  const y = try m.zeros(n * hd * 4);
                  try m.k.k.addb(m.s, y, try m.one(dm.t, x, n), n * hd);
                  try m.sum(y, n * hd);
@@ -521,7 +564,7 @@ index cc06f8f..63c6fec 100644
              },
              .moe => |e| {
                  const E: usize = c.experts;
-@@ -558,18 +576,23 @@ pub const Model = struct {
+@@ -558,18 +578,23 @@ pub const Model = struct {
                  const picks = try m.buf(n * K * 4);
                  const wts = try m.buf(n * K * 4);
                  try m.k.glue.topk(m.s, logits, e.bias, .{ .experts = E, .topk = K, .shared = false, .normalize = true, .scale = c.route_scale, .score = true }, picks, wts, n);
@@ -655,7 +698,7 @@ index 68defae..c087165 100644
 +    pub const explain = @import("native.zig").explain;
 +};
 diff --git a/zig/src/families/hy4_flash/serve.zig b/zig/src/families/hy4_flash/serve.zig
-index 9909c93..08f70a3 100644
+index 9909c93..2ca99a4 100644
 --- a/zig/src/families/hy4_flash/serve.zig
 +++ b/zig/src/families/hy4_flash/serve.zig
 @@ -27,47 +27,51 @@ pub const Link = struct {
@@ -723,6 +766,15 @@ index 9909c93..08f70a3 100644
          }
          return .{ .h = h, .ids = l.ids[0..h.n] };
      }
+@@ -183,7 +187,7 @@ pub const Hy4 = struct {
+     /// The round loop's facts: one stream; DFly holds 5 drafts a round when loaded (two Sparks' measured ms).
+     pub fn facts(x: *const Hy4) lanes.Model {
+         const head = x.calls.draft != null;
+-        return .{ .exact_width = max_window, .copy_drafts = false, .gpu_tokens = false, .mtp = head, .speculate = head, .speculate_early = false, .drafts = dfly.drafts, .draft_prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7 }, .window_costs = &costs, .mtp_step_ms = 0, .max_streams = 1 };
++        return .{ .exact_width = max_window, .copy_drafts = false, .gpu_tokens = false, .mtp = head, .speculate = head, .speculate_early = false, .drafts = dfly.drafts, .draft_prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7, 0.65 }, .window_costs = &costs, .mtp_step_ms = 0, .max_streams = 1 };
+     }
+ 
+     /// A drafted round (DFly's 5 drafts, then the 6-row verify) takes ~88 ms on two Sparks whatever its width.
 diff --git a/zig/src/families/hy4_flash/weights.zig b/zig/src/families/hy4_flash/weights.zig
 index b6eafae..f6743f5 100644
 --- a/zig/src/families/hy4_flash/weights.zig
