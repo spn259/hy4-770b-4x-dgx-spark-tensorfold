@@ -9,6 +9,7 @@ RANK0_IP="${RANK0_IP:-192.168.68.119}"
 SOCKET_IF="${SOCKET_IF:-enP7s7}"
 PORT="${PORT:-8895}"
 CONTEXT="${CONTEXT:-45056}"
+TEMPERATURE="${TEMPERATURE:-0.3}"
 BIN="${BIN:-/home/spnichol/hy4-770b/bin/tensorfold-native}"
 MODEL_BASE="${MODEL_BASE:-/home/spnichol/hy4-770b/Hy4-NVFP4-rank}"
 
@@ -19,9 +20,12 @@ for r in 0 1 2 3; do
     LD_LIBRARY_PATH=\$HOME/nccl-2.30.7:/usr/local/cuda/lib64 \
     NCCL_COMM_ID=${RANK0_IP}:29551 \
     NCCL_SOCKET_IFNAME=${SOCKET_IF} \
-    NCCL_ALGO=Ring \
-    NCCL_CROSS_NIC=1 \
+    NCCL_IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1 \
     NCCL_IB_SUBNET_AWARE_ROUTING=1 \
+    NCCL_IB_SUBNET_PREFIX_LEN=24 \
+    NCCL_ALGO=Ring \
+    NCCL_PROTO=LL,LL128,Simple \
+    NCCL_CROSS_NIC=1 \
     NCCL_P2P_DISABLE=1 \
     NCCL_SHM_DISABLE=1 \
     NCCL_MIN_NCHANNELS=4 \
@@ -29,7 +33,7 @@ for r in 0 1 2 3; do
     NCCL_DEBUG=WARN \
     TF_HY4_FP8=1 \
     TENSORFOLD_MEMORY_RESERVE_GIB=4 \
-    ${BIN} serve --backend cuda --tp 4 --rank ${r} --host 0.0.0.0 --port ${PORT} --context ${CONTEXT} --name hy4 ${MODEL_BASE}${r} \
+    ${BIN} serve --backend cuda --tp 4 --rank ${r} --host 0.0.0.0 --port ${PORT} --context ${CONTEXT} --temperature ${TEMPERATURE} --name hy4 ${MODEL_BASE}${r} \
     > \$HOME/hy4-770b/serve-rank${r}.log 2>&1 < /dev/null &" &
 done
 wait

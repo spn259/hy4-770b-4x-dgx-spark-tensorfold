@@ -7,6 +7,7 @@ Run **[`tencent/Hy4`](https://huggingface.co/tencent/Hy4)** — the flagship **7
 - **Weights on Hugging Face:** [`spnichol/Hy4-NVFP4-DFly2`](https://huggingface.co/spnichol/Hy4-NVFP4-DFly2) *(pre-sharded per rank so each Spark only needs ~150 GB NVMe)*
 - **Custom TensorFold Patch:** [`patches/0001-hy4-770b-cuda-dsa-ring-tp4.patch`](patches/0001-hy4-770b-cuda-dsa-ring-tp4.patch)
 - **Streaming Quantizer:** [`scripts/quantize_hy4.py`](scripts/quantize_hy4.py)
+- **OpenAI Tool-Call & Single-Stream Proxy:** [`scripts/hy4_omp_proxy.py`](scripts/hy4_omp_proxy.py)
 
 ---
 
@@ -35,7 +36,7 @@ Run **[`tencent/Hy4`](https://huggingface.co/tencent/Hy4)** — the flagship **7
    - Adds `hy_v4_vl` / `hy_v4` family support: 78 layers (1 dense + 77 MoE), 256 routed experts operating directly on `hidden_size=6144` (no latent bottleneck, no Engram, optional sandwich norms).
    - Adds custom CUDA kernels in `hy4_flash.cu`:
      - `tf_hy4_layernorm` (FP32 LayerNorm with BF16 weight + bias for `indexer.k_norm`)
-     - `tf_hy4_dsa_scores` (32-head, dim-128 token-level causal `ReLU(q · k) * w` scoring)
+     - `tf_hy4_dsa_scores` (Tensor-Core BF16 `mma.sync.aligned.m16n8k16` 32-head, dim-128 causal `ReLU(q · k) * w` scoring — 64 keys/CTA)
      - `tf_hy4_dsa_select` (8-bit radix top-2048 selector writing directly to `int32` token lists)
    - Implements **IndexCache** (reuses top-2048 indices from the 20 `"full"` indexer layers across the 58 `"shared"` layers).
    - Replaces cross-ring point-to-point `ncclSend`/`ncclRecv` in `serve.zig` with **Ring-safe `allGather`**, enabling zero-switch **4-node 200 Gb/s ConnectX-7 RoCE rings** (`NCCL_ALGO=Ring`).
@@ -81,8 +82,11 @@ Align ranks `0 → 1 → 2 → 3 → 0` to your physical ConnectX-7 ring cables,
 ./scripts/launch_tp4_ring.sh
 ```
 
-Query the OpenAI-compatible API on Rank 0 (`:8895`):
+Query the OpenAI-compatible API on Rank 0 (`:8895`), or run [`scripts/hy4_omp_proxy.py`](scripts/hy4_omp_proxy.py) on `:8896` if your client (e.g. OMP) needs standard OpenAI `tool_calls` translation from Hy4's `<tool_calls:opensource>` XML and request serialization for single-stream serving:
 ```bash
+# Optional local proxy for OpenAI tool_calls + single-stream serialization
+HY4_UPSTREAM=http://<rank0-ip>:8895 HY4_DEFAULT_TEMP=0.3 python3 scripts/hy4_omp_proxy.py
+
 curl -s http://<rank0-ip>:8895/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
