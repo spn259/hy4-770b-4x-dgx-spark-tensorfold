@@ -1,0 +1,782 @@
+diff --git a/zig/kernels/cuda/hy4_flash.cu b/zig/kernels/cuda/hy4_flash.cu
+index 28c4199..84d8159 100644
+--- a/zig/kernels/cuda/hy4_flash.cu
++++ b/zig/kernels/cuda/hy4_flash.cu
+@@ -508,3 +508,182 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_dfly_tokens(const int*
+   if (threadIdx.x <= r) tok[r * w + kept + threadIdx.x] = (int)(p + threadIdx.x);
+   if (threadIdx.x == 0) cnt[r] = kept + (int)r + 1;
+ }
++
++// Standard LayerNorm: fp32 x (stride xs) -> bf16 out (stride os), with bf16 weight and bias.
++extern "C" __global__ void __launch_bounds__(256) tf_hy4_layernorm(const float* x, int64_t xs, const __nv_bfloat16* w,
++                                                                   const __nv_bfloat16* b, __nv_bfloat16* out,
++                                                                   int64_t os, int64_t n, float eps) {
++  __shared__ float sm[8], sv[8];
++  const int64_t r = blockIdx.x;
++  const float* xr = x + r * xs;
++  float sum = 0.0f;
++  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) sum += xr[i];
++  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
++  if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = sum;
++  __syncthreads();
++  float mean = 0.0f;
++  for (int i = 0; i < 8; ++i) mean += sm[i];
++  mean /= (float)n;
++  float var = 0.0f;
++  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
++    const float d = xr[i] - mean;
++    var += d * d;
++  }
++  for (int o = 16; o > 0; o >>= 1) var += __shfl_xor_sync(0xffffffffu, var, o);
++  if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = var;
++  __syncthreads();
++  float vsum = 0.0f;
++  for (int i = 0; i < 8; ++i) vsum += sv[i];
++  const float inv = rsqrtf(vsum / (float)n + eps);
++  __nv_bfloat16* orow = out + r * os;
++  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
++    const float y = (xr[i] - mean) * inv * __bfloat162float(w[i]) + __bfloat162float(b[i]);
++    orow[i] = __float2bfloat16_rn(y);
++  }
++}
++
++// Hy4 standard DSA indexer scores: 32 heads, dim 128, token-level keys kc [nk][128].
++// Block (row, 32 keys) of 256: sum_{h=0..31} w[r,h] * scale * relu(q[r,h] . kc[t]) for t <= pos[0]+r, -inf past.
++extern "C" __global__ void __launch_bounds__(256) tf_hy4_dsa_scores(const __nv_bfloat16* q, const float* w,
++                                                                    const __nv_bfloat16* kc, const int* pos, float* out,
++                                                                    int64_t nk, float scale) {
++  constexpr int H = 32, D = 128;
++  __shared__ float qs[H][D];
++  const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
++  for (int i = threadIdx.x; i < H * D; i += blockDim.x) qs[i / D][i % D] = __bfloat162float(q[r * H * D + i]);
++  __syncthreads();
++  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++  for (int j = warp; j < 32; j += 8) {
++    const int64_t t = (int64_t)blockIdx.y * 32 + j;
++    if (t >= nk) return;
++    float sc;
++    if (t > p) sc = -INFINITY;
++    else {
++      float k4[4];
++      for (int c = 0; c < 4; ++c) k4[c] = __bfloat162float(kc[t * D + lane * 4 + c]);
++      sc = 0.0f;
++      for (int h = 0; h < H; ++h) {
++        float dot = 0.0f;
++        for (int c = 0; c < 4; ++c) dot = __fmaf_rn(qs[h][lane * 4 + c], k4[c], dot);
++        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
++        sc = __fmaf_rn(w[r * H + h] * scale, fmaxf(dot, 0.0f), sc);
++      }
++    }
++    if (lane == 0) out[r * nk + t] = sc;
++  }
++}
++
++// Token-level 8-bit radix top-K selector (vis = pos[0] + r + 1), writes int32 tok[r][k] and cnt[r].
++namespace hy4_dsa_sel {
++__device__ __forceinline__ uint32_t order_key(float v) {
++  if (isnan(v)) return 0u;
++  const uint32_t u = __float_as_uint(v);
++  return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
++}
++template <int W>
++__device__ __forceinline__ int block_scan(int v, int (*wsum)[W], int slot, int* total) {
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  int inc = v;
++  for (int o = 1; o < 32; o <<= 1) {
++    const int s = __shfl_up_sync(0xffffffffu, inc, o);
++    if (lane >= o) inc += s;
++  }
++  if (lane == 31) wsum[slot][warp] = inc;
++  __syncthreads();
++  int before = inc - v;
++  for (int w = 0; w < warp; ++w) before += wsum[slot][w];
++  int all = 0;
++  for (int w = 0; w < W; ++w) all += wsum[slot][w];
++  *total = all;
++  return before;
++}
++}  // namespace hy4_dsa_sel
++
++extern "C" __global__ void __launch_bounds__(256) tf_hy4_dsa_select(const float* scores, int* tok, int* cnt,
++                                                                    int64_t nk, const int* pos, int k) {
++  constexpr int T = 256;
++  __shared__ int hist[256];
++  __shared__ uint32_t sh_prefix;
++  __shared__ int sh_need, wsum[2][T / 32];
++  const int64_t r = blockIdx.x;
++  const float* row = scores + r * nk;
++  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++  const unsigned below = (1u << lane) - 1;
++  const int64_t vis = (int64_t)pos[0] + r + 1;
++  const int64_t limit = nk < vis ? nk : vis;
++  if (limit <= k) {
++    for (int64_t i = t; i < limit; i += T) tok[r * k + i] = (int)i;
++    if (t == 0) cnt[r] = (int)limit;
++    return;
++  }
++  uint32_t prefix = 0, fixed = 0;
++  int need = k;
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    for (int b = t; b < 256; b += T) hist[b] = 0;
++    __syncthreads();
++    for (int64_t c = 0; c < limit; c += 8 * T) {
++      for (int j = 0; j < 8; ++j) {
++        const int64_t idx = c + 8 * t + j;
++        const uint32_t u = idx < limit ? hy4_dsa_sel::order_key(row[idx]) : 0u;
++        const int b = idx < limit && (u & fixed) == prefix ? (int)((u >> shift) & 0xFF) : 256;
++        if (__any_sync(0xffffffffu, b < 256)) {
++          const unsigned same = __match_any_sync(0xffffffffu, b);
++          if (b < 256 && (same & below) == 0) atomicAdd(&hist[b], __popc(same));
++        }
++      }
++    }
++    __syncthreads();
++    if (warp == 0) {
++      int h[8], own = 0;
++      for (int j = 0; j < 8; ++j) own += h[j] = hist[255 - 8 * lane - j];
++      int upto = own;
++      for (int o = 1; o < 32; o <<= 1) {
++        const int v = __shfl_up_sync(0xffffffffu, upto, o);
++        if (lane >= o) upto += v;
++      }
++      const unsigned hit = __ballot_sync(0xffffffffu, upto >= need);
++      if (lane == (hit ? __ffs(hit) - 1 : 31)) {
++        int above = upto - own, digit = 0;
++        for (int j = 0; j < 8; ++j) {
++          if (above + h[j] >= need) { digit = 255 - 8 * lane - j; break; }
++          above += h[j];
++        }
++        sh_need = need - above;
++        sh_prefix = prefix | ((uint32_t)digit << shift);
++      }
++    }
++    __syncthreads();
++    need = sh_need;
++    prefix = sh_prefix;
++    fixed |= 0xFFu << shift;
++    __syncthreads();
++  }
++  int run_take = 0, run_eq = 0;
++  for (int64_t c = 0; c < limit; c += 8 * T) {
++    bool eq[8], gt[8];
++    int eqs = 0;
++    for (int j = 0; j < 8; ++j) {
++      const int64_t idx = c + 8 * t + j;
++      const bool in = idx < limit;
++      const uint32_t u = in ? hy4_dsa_sel::order_key(row[idx]) : 0u;
++      eq[j] = in && u == prefix;
++      gt[j] = in && u > prefix;
++      eqs += eq[j];
++    }
++    int all_eq, all_take;
++    int seen = run_eq + hy4_dsa_sel::block_scan<T / 32>(eqs, wsum, 0, &all_eq);
++    bool take[8];
++    int takes = 0;
++    for (int j = 0; j < 8; ++j) {
++      take[j] = gt[j] || (eq[j] && seen < need);
++      seen += eq[j];
++      takes += take[j];
++    }
++    int at = run_take + hy4_dsa_sel::block_scan<T / 32>(takes, wsum, 1, &all_take);
++    for (int j = 0; j < 8; ++j)
++      if (take[j]) tok[r * k + at++] = (int)(c + 8 * t + j);
++    run_eq += all_eq;
++    run_take += all_take;
++  }
++  if (t == 0) cnt[r] = k;
++}
+diff --git a/zig/src/families/hy4_flash/config.zig b/zig/src/families/hy4_flash/config.zig
+index 3580956..129e2ca 100644
+--- a/zig/src/families/hy4_flash/config.zig
++++ b/zig/src/families/hy4_flash/config.zig
+@@ -2,7 +2,7 @@
+ const std = @import("std");
+ 
+ /// Backbone layers the per-layer tables hold (Hy4-flash has 42).
+-pub const max_layers = 64;
++pub const max_layers = 128;
+ 
+ /// The most drafter taps into the backbone (Hy4-flash's DFly has 5).
+ pub const max_taps = 8;
+@@ -57,6 +57,8 @@ pub const Text = struct {
+     kinds: [max_layers]Kind,
+     moe: [max_layers]bool, // false: the layer's MLP is dense
+     engram: [max_layers]bool,
++    is_v4: bool = false,
++    indexer_full: [max_layers]bool = @splat(false),
+ 
+     pub fn heads(c: *const Text, i: u32) Heads {
+         return if (c.kinds[i] == .sliding) c.sliding else c.sparse;
+@@ -332,6 +334,79 @@ fn drafter(top: std.json.ObjectMap, layers: u32, why: *Why) !?Drafter {
+ }
+ 
+ /// config.json as the reference (transformers' hy_v4_flash, vLLM's HYV4FlashConfig) reads it.
++
++fn parseV4(top: std.json.ObjectMap, o: std.json.ObjectMap, why: *Why) !Config {
++    var c = std.mem.zeroes(Config);
++    const t = &c.text;
++    t.is_v4 = true;
++    t.hidden = try int(o, "hidden_size", why);
++    t.layers = try int(o, "num_hidden_layers", why);
++    t.vocab = try int(o, "vocab_size", why);
++    t.eps = try float(o, "rms_norm_eps", why);
++    t.max_context = try int(o, "max_position_embeddings", why);
++    t.hc = try int(o, "hc_mult", why);
++    if (t.layers == 0 or t.layers > max_layers or t.hidden == 0 or t.vocab == 0 or t.hc == 0) {
++        why.set("hy_v4: invalid shape {d} layers, {d} hidden", .{ t.layers, t.hidden });
++        return error.BadConfig;
++    }
++    t.sparse = .{
++        .q = try int(o, "num_attention_heads", why),
++        .nope = try int(o, "qk_nope_head_dim", why),
++        .rope = try int(o, "qk_rope_head_dim", why),
++        .v = try int(o, "v_head_dim", why),
++    };
++    t.sliding = t.sparse;
++    t.q_rank = try int(o, "q_lora_rank", why);
++    t.kv_rank = try int(o, "kv_lora_rank", why);
++    t.window = 0;
++    t.index_topk = try int(o, "index_topk", why);
++    t.index_heads = try int(o, "index_n_heads", why);
++    t.index_dim = try int(o, "index_head_dim", why);
++    t.compress = 1;
++    t.group_topk = t.index_topk;
++    t.dense_inter = try int(o, "intermediate_size", why);
++    t.experts = try int(o, "n_routed_experts", why);
++    t.topk = try int(o, "num_experts_per_tok", why);
++    t.latent = t.hidden;
++    t.expert_inter = try int(o, "moe_intermediate_size", why);
++    t.shared = try int(o, "n_shared_experts", why);
++    t.route_scale = try float(o, "routed_scaling_factor", why);
++    t.swiglu_limit = try float(o, "swiglu_limit", why);
++    const idx_list = o.get("indexer_types");
++    const mlp_list = o.get("mlp_layer_types");
++    const first_dense: u32 = if (o.get("first_k_dense_replace")) |v| @intCast(v.integer) else 1;
++    for (0..t.layers) |i| {
++        t.kinds[i] = .sparse;
++        t.engram[i] = false;
++        if (mlp_list) |ml| {
++            const mv = ml.array.items[i];
++            t.moe[i] = mv == .string and std.mem.eql(u8, mv.string, "sparse");
++        } else {
++            t.moe[i] = i >= first_dense;
++        }
++        if (idx_list) |il| {
++            const iv = il.array.items[i];
++            t.indexer_full[i] = iv == .string and std.mem.eql(u8, iv.string, "full");
++        } else {
++            t.indexer_full[i] = (i == 0 or (i - 1) % 4 == 0);
++        }
++    }
++    if (top.get("dfly_target_kv_layers")) |taps| {
++        if (taps == .array and taps.array.items.len > 0 and taps.array.items.len <= max_taps) {
++            var d = std.mem.zeroes(Drafter);
++            d.layers = @intCast(taps.array.items.len);
++            d.tokens = 5;
++            for (taps.array.items, 0..) |v, j| d.taps[j] = @intCast(v.integer);
++            d.taps_n = d.layers;
++            c.drafter = d;
++        }
++    }
++    c.has_vision = top.get("vision_config") != null;
++    c.eos = try int(o, "eos_token_id", why);
++    c.image_token = if (top.get("image_token_id")) |_| try int(top, "image_token_id", why) else 0;
++    return c;
++}
++
+ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
+     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch {
+         why.set("config.json is not JSON", .{});
+@@ -341,7 +416,12 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
+     if (parsed.value != .object) return error.BadConfig;
+     const top = parsed.value.object;
+     const inner = top.get("text_config");
+-    if (!std.mem.eql(u8, text(top, "model_type"), "hy_v4_flash") or inner == null or inner.? != .object) {
++    const mt = text(top, "model_type");
++    if (std.mem.eql(u8, mt, "hy_v4_vl") or std.mem.eql(u8, mt, "hy_v4")) {
++        const sub = if (inner != null and inner.? == .object) inner.?.object else top;
++        return parseV4(top, sub, why);
++    }
++    if (!std.mem.eql(u8, mt, "hy_v4_flash") or inner == null or inner.? != .object) {
+         why.set("not a Hy4-flash checkpoint: model_type hy_v4_flash with a text_config", .{});
+         return error.NotHy4Flash;
+     }
+diff --git a/zig/src/families/hy4_flash/cuda.zig b/zig/src/families/hy4_flash/cuda.zig
+index fd9c8f5..a256cb0 100644
+--- a/zig/src/families/hy4_flash/cuda.zig
++++ b/zig/src/families/hy4_flash/cuda.zig
+@@ -12,6 +12,8 @@ pub const config = @import("config.zig");
+ pub const files = @import("files.zig");
+ pub const serve = @import("serve.zig");
+ pub const native = @import("native.zig");
++pub const native_v4 = native.v4;
++pub const native_v4_text = native.v4_text;
+ 
+ const Stream = cuda.Stream;
+ const Args = cuda.launch.Args;
+@@ -48,6 +50,9 @@ pub const Kernels = struct {
+     idx_pool: Function,
+     idx_scores: Function,
+     idx_tokens: Function,
++    layernorm: Function,
++    dsa_scores: Function,
++    dsa_select: Function,
+     dfly_tokens: Function,
+     swiglu_fn: Function,
+     route_fn: Function,
+@@ -83,6 +88,9 @@ pub const Kernels = struct {
+             .idx_pool = try mod.function("tf_hy4_idx_pool"),
+             .idx_scores = try mod.function("tf_hy4_idx_scores"),
+             .idx_tokens = try mod.function("tf_hy4_idx_tokens"),
++            .layernorm = try mod.function("tf_hy4_layernorm"),
++            .dsa_scores = try mod.function("tf_hy4_dsa_scores"),
++            .dsa_select = try mod.function("tf_hy4_dsa_select"),
+             .dfly_tokens = try mod.function("tf_hy4_dfly_tokens"),
+             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
+             .route_fn = try mod.function("tf_hy4_route"),
+@@ -122,6 +130,25 @@ pub const Kernels = struct {
+     }
+ 
+     /// out [rows] rows os apart = bf16 RMS norm of fp32 x rows xs apart, n wide, times the bf16 weight.
++
++    pub fn layerNorm(k: *const Kernels, s: Stream, x: u64, xs: usize, w: u64, b: u64, out: u64, os: usize, rows: usize, n: usize, eps: f32) !void {
++        var a: Args = .{};
++        inline for (.{ x, i64of(xs), w, b, out, i64of(os), i64of(n), eps }) |v| a.add(v);
++        try cuda.launch.launch(k.layernorm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
++    pub fn dsaScores(k: *const Kernels, s: Stream, q: u64, w: u64, kc: u64, pos: u64, out: u64, rows: usize, nk: usize, scale: f32) !void {
++        var a: Args = .{};
++        inline for (.{ q, w, kc, pos, out, i64of(nk), scale }) |v| a.add(v);
++        try cuda.launch.launch(k.dsa_scores, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(nk, 32) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
++    pub fn dsaSelect(k: *const Kernels, s: Stream, scores: u64, tok: u64, cnt: u64, rows: usize, nk: usize, pos: u64, topk: usize) !void {
++        var a: Args = .{};
++        inline for (.{ scores, tok, cnt, i64of(nk), pos, @as(c_int, @intCast(topk)) }) |v| a.add(v);
++        try cuda.launch.launch(k.dsa_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
+     pub fn rmsNorm(k: *const Kernels, s: Stream, x: u64, xs: usize, w: u64, out: u64, os: usize, rows: usize, n: usize, eps: f32) !void {
+         var a: Args = .{};
+         inline for (.{ x, i64of(xs), w, out, i64of(os), i64of(n), eps }) |v| a.add(v);
+diff --git a/zig/src/families/hy4_flash/dfly.zig b/zig/src/families/hy4_flash/dfly.zig
+index 237c9f4..1a961d0 100644
+--- a/zig/src/families/hy4_flash/dfly.zig
++++ b/zig/src/families/hy4_flash/dfly.zig
+@@ -7,7 +7,7 @@ const Model = engine.Model;
+ const Lin = engine.Lin;
+ 
+ /// Draft tokens a round: the block is the last sampled token and this many masks.
+-pub const drafts = 5;
++pub const drafts = 6;
+ const width = drafts + 1;
+ 
+ const Layer = struct { attn: engine.Attn, in_norm: u64, post_norm: u64, gate_up: Lin, down: Lin, inter: usize, kv: usize };
+diff --git a/zig/src/families/hy4_flash/engine.zig b/zig/src/families/hy4_flash/engine.zig
+index cc06f8f..63c6fec 100644
+--- a/zig/src/families/hy4_flash/engine.zig
++++ b/zig/src/families/hy4_flash/engine.zig
+@@ -15,7 +15,7 @@ pub const row_width = 576;
+ /// The rows a step takes at most when only its last row's token is wanted (longer prompts go in chunks).
+ pub const max_step_rows = 2048;
+ /// A verify block's rows: the last token and DFly's drafts.
+-pub const verify_rows = 6;
++pub const verify_rows = 7;
+ const hc_eps: f32 = 1e-6;
+ const hc_magnitude: f32 = 2.0;
+ /// Engram's nn.RMSNorm(eps=None): the reference matches float32's eps (hy4-real-check).
+@@ -129,6 +129,8 @@ pub const Model = struct {
+     use_index: bool = true,
+     /// DFly's view of the target's indexer: the last step's recalled lists for its draft layers' target layers.
+     snap: ?Snap = null,
++    shared_tok: u64 = 0,
++    shared_cnt: u64 = 0,
+     /// A check's copy of one layer's recalled groups ([rows][512] int64 at `probe`; 0: none).
+     probe: u64 = 0,
+     probe_layer: usize = 0,
+@@ -356,6 +358,7 @@ pub const Model = struct {
+         const pos_h = [2]i32{ @intCast(p0), @intCast(p0 + 3) };
+         try view(m, m.pos, 4).upload(0, std.mem.sliceAsBytes(pos_h[0..1]));
+         try view(m, m.pos3, 4).upload(0, std.mem.sliceAsBytes(pos_h[1..2]));
++        if (m.eg.layers == 0) return;
+         const hash = try m.gpa.alloc(i32, n * engram.heads);
+         defer m.gpa.free(hash);
+         const toks = m.tokens.items;
+@@ -402,6 +405,10 @@ pub const Model = struct {
+         errdefer std.log.err("hy4 step: failed in layer {d}'s {s} ({d} rows at {d})", .{ at, stage, n, p0 });
+         var t: i96 = if (m.prof) |io| std.Io.Clock.awake.now(io).toNanoseconds() else 0;
+         try m.mark(3, &t);
++        if (c.is_v4) {
++            m.shared_tok = try m.buf(n * c.index_topk * 4);
++            m.shared_cnt = try m.buf(n * 4);
++        }
+         const kept = m.used; // a layer's scratch is taken back at its end: a step holds one layer's at a time
+         for (m.layers, 0..) |*L, i| {
+             m.used = kept;
+@@ -478,7 +485,9 @@ pub const Model = struct {
+         const win: usize = c.window;
+         const recall: usize = c.index_topk; // the indexer runs once the keys outgrow it
+         if (a.idx) |ix| try index.keys(m, ix, x, pos, a.inv_freq, n);
+-        const indexed = a.idx != null and keys > recall and m.use_index;
++        if (a.dsa_idx) |ix| try index.dsaKeys(m, ix, x, pos, a.inv_freq, n);
++        const dsa_indexed = c.is_v4 and !a.sliding and list == null and keys > recall and m.use_index;
++        const indexed = (a.idx != null and keys > recall and m.use_index) or dsa_indexed;
+         const nch: usize = if (list) |li| (li.w + 511) / 512 else if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
+         const part: cuda.mla.Partials = .{ .po = try m.zeros(nch * n * H * 512 * 4), .pm = try m.zeros(nch * n * H * 4), .pl = try m.zeros(nch * n * H * 4) };
+         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sparse.nope + c.sparse.rope)));
+@@ -489,6 +498,9 @@ pub const Model = struct {
+             const cnt = try m.buf(n * 4);
+             try k.window(m.s, pos, tok, cnt, n, win);
+             try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, tok, cnt, win, part, n, H, scale);
++        } else if (dsa_indexed) {
++            if (a.dsa_idx) |ix| try index.dsaRecalled(m, ix, x, qr, pos, a.inv_freq, keys, n, m.shared_tok, m.shared_cnt);
++            try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, m.shared_tok, m.shared_cnt, recall, part, n, H, scale);
+         } else if (indexed) {
+             const tok = try m.buf(n * recall * 4);
+             const cnt = try m.buf(n * 4);
+@@ -509,7 +521,7 @@ pub const Model = struct {
+         try m.proj(a.o, o, H * 256, po, n);
+         try m.sum(po, n * hd);
+         const out = try m.buf(n * hd * 2);
+-        try k.rmsNorm(m.s, po, hd, a.post_norm, out, hd, n, hd, c.eps);
++        if (a.post_norm != 0) try k.rmsNorm(m.s, po, hd, a.post_norm, out, hd, n, hd, c.eps) else try k.castRows(m.s, po, hd, out, hd, n, hd);
+         return out;
+     }
+ 
+@@ -518,7 +530,8 @@ pub const Model = struct {
+         var t = t_;
+         if (skip >= 0) t.experts += 1; // the other ranks' picks, planned as one more expert and skipped
+         const pairs = n * per;
+-        const tile = cuda.experts.promptTile(.nvfp4);
++        const is_dec = n <= 16;
++        const tile: usize = if (is_dec) 16 else cuda.experts.promptTile(.nvfp4);
+         const items = cuda.grouped.maxItems(pairs, t.experts, tile);
+         const wide = pairs > cuda.grouped.small;
+         const plan: cuda.grouped.Plan = .{ .members = try m.zeros(pairs * 4), .items = try m.zeros(items * 12), .counts = try m.zeros(8), .rank = try m.zeros((if (wide) pairs else 1) * 4), .hist = try m.zeros((if (wide) (pairs + 1023) / 1024 * t.experts else 1) * 4) };
+@@ -526,8 +539,13 @@ pub const Model = struct {
+         const act = try m.buf(pairs * t.width * 2);
+         const y = try m.zeros(pairs * t.dims * 2);
+         const g: cuda.experts.Grouped = .{ .nvfp4 = &m.k.x };
+-        try g.prompt(m.s, .up, .{ .x = x, .stride = t.dims, .slots = per }, t, plan, act, items, pairs, tile, skip);
+-        try g.prompt(m.s, .down_bf16, .{ .x = act, .stride = t.width }, t, plan, y, items, pairs, tile, skip);
++        if (is_dec) {
++            try g.decode(m.s, .up, .{ .x = x, .stride = t.dims, .slots = per }, t, plan, act, items, pairs, tile, skip);
++            try g.decode(m.s, .down_bf16, .{ .x = act, .stride = t.width }, t, plan, y, items, pairs, tile, skip);
++        } else {
++            try g.prompt(m.s, .up, .{ .x = x, .stride = t.dims, .slots = per }, t, plan, act, items, pairs, tile, skip);
++            try g.prompt(m.s, .down_bf16, .{ .x = act, .stride = t.width }, t, plan, y, items, pairs, tile, skip);
++        }
+         const out = try m.buf(n * t.dims * 2);
+         try m.k.glue.combine(m.s, y, .bf16, wts, out, .bf16, n, per, t.dims);
+         return out;
+@@ -547,7 +565,7 @@ pub const Model = struct {
+                 const y = try m.zeros(n * hd * 4);
+                 try m.k.k.addb(m.s, y, try m.one(dm.t, x, n), n * hd);
+                 try m.sum(y, n * hd);
+-                try m.k.k.rmsNorm(m.s, y, hd, dm.norm, out, hd, n, hd, c.eps);
++                if (dm.norm != 0) try m.k.k.rmsNorm(m.s, y, hd, dm.norm, out, hd, n, hd, c.eps) else try m.k.k.castRows(m.s, y, hd, out, hd, n, hd);
+             },
+             .moe => |e| {
+                 const E: usize = c.experts;
+@@ -558,18 +576,23 @@ pub const Model = struct {
+                 const picks = try m.buf(n * K * 4);
+                 const wts = try m.buf(n * K * 4);
+                 try m.k.glue.topk(m.s, logits, e.bias, .{ .experts = E, .topk = K, .shared = false, .normalize = true, .scale = c.route_scale, .score = true }, picks, wts, n);
+-                const xl_f = try m.buf(n * lat * 4);
+-                try m.proj(e.down, x, hd, xl_f, n);
+-                const xl = try m.buf(n * lat * 2);
+-                try m.k.k.castRows(m.s, xl_f, lat, xl, lat, n, lat);
+                 const own = e.routed.experts;
+                 if (m.world > 1) try m.k.k.own(m.s, picks, wts, n * K, m.rank * own, own);
+-                const combined = try m.grouped(e.routed, xl, picks, wts, n, K, if (m.world > 1) @intCast(own) else -1);
+-                const routed = try m.buf(n * hd * 4);
+-                try m.proj(e.up, combined, lat, routed, n);
++                const routed = try m.zeros(n * hd * 4);
++                if (e.down) |dn| {
++                    const xl_f = try m.buf(n * lat * 4);
++                    try m.proj(dn, x, hd, xl_f, n);
++                    const xl = try m.buf(n * lat * 2);
++                    try m.k.k.castRows(m.s, xl_f, lat, xl, lat, n, lat);
++                    const combined = try m.grouped(e.routed, xl, picks, wts, n, K, if (m.world > 1) @intCast(own) else -1);
++                    try m.proj(e.up.?, combined, lat, routed, n);
++                } else {
++                    const combined = try m.grouped(e.routed, x, picks, wts, n, K, if (m.world > 1) @intCast(own) else -1);
++                    try m.k.k.addb(m.s, routed, combined, n * hd);
++                }
+                 try m.k.k.addb(m.s, routed, try m.one(e.shared, x, n), n * hd);
+                 try m.sum(routed, n * hd);
+-                try m.k.k.rmsNorm(m.s, routed, hd, e.norm, out, hd, n, hd, c.eps);
++                if (e.norm != 0) try m.k.k.rmsNorm(m.s, routed, hd, e.norm, out, hd, n, hd, c.eps) else try m.k.k.castRows(m.s, routed, hd, out, hd, n, hd);
+             },
+         }
+         return out;
+diff --git a/zig/src/families/hy4_flash/files.zig b/zig/src/families/hy4_flash/files.zig
+index 4bd2785..e9742c9 100644
+--- a/zig/src/families/hy4_flash/files.zig
++++ b/zig/src/families/hy4_flash/files.zig
+@@ -28,6 +28,7 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, why: *config.Wh
+     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+     defer parsed.deinit();
+     const o = parsed.value.object;
++    if (!s.cfg.text.is_v4) {
+     const tc = o.get("text_config").?.object;
+     const sizes = tc.get("engram_layer_head_vocab_sizes").?.object;
+     for (tc.get("engram_layer_ids").?.array.items) |id| {
+@@ -41,6 +42,7 @@ pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, why: *config.Wh
+         };
+         try s.heads.append(gpa, one);
+     }
++    }
+     if (o.get("dfly_target_kv_layers")) |kv| {
+         for (kv.array.items, 0..) |v, i| s.kv[i] = @intCast(v.integer);
+         s.n_kv = kv.array.items.len;
+diff --git a/zig/src/families/hy4_flash/index.zig b/zig/src/families/hy4_flash/index.zig
+index c639d7c..9a6920e 100644
+--- a/zig/src/families/hy4_flash/index.zig
++++ b/zig/src/families/hy4_flash/index.zig
+@@ -48,3 +48,30 @@ fn snapshot(m: *Model, sn: *engine.Snap, j: usize, tok: u64, cnt: u64, n: usize)
+     const dc: cuda.DeviceBuffer = .{ .d = m.d, .ptr = sn.cnt + j * engine.verify_rows * 4, .len = take * 4, .borrowed = true };
+     try dc.copyFrom(0, cnt + first * 4, take * 4, m.s.handle);
+ }
++
++/// Hy4 standard DSA indexer: compute k = rope_tail(layernorm(wk(x))) and store into k_cache at pos..
++pub fn dsaKeys(m: *Model, ix: wt.DsaIndexer, x: u64, pos: u64, inv_freq: u64, n: usize) !void {
++    const k = &m.k.k;
++    const f = try m.buf(n * 128 * 4);
++    try m.proj(ix.wk, x, m.c.hidden, f, n);
++    const rows = try m.buf(n * 128 * 2);
++    try k.layerNorm(m.s, f, 128, ix.k_norm_w, ix.k_norm_b, rows, 128, n, 128, m.c.eps);
++    try m.k.mla.rope(m.s, .{ .x = rows + 64 * 2, .x_row = 128, .x_head = 0, .out = rows + 64 * 2, .o_row = 128, .o_head = 0 }, n, 1, pos, inv_freq, 1.0);
++    try k.put(m.s, ix.k_cache, rows, pos, n, 128);
++}
++
++/// Hy4 standard DSA indexer: 32 heads, dim 128, ReLU(q.k)*w over nk keys, top-2048 into tok/cnt.
++pub fn dsaRecalled(m: *Model, ix: wt.DsaIndexer, x: u64, qr: u64, pos: u64, inv_freq: u64, nk: usize, n: usize, tok: u64, cnt: u64) !void {
++    const k = &m.k.k;
++    const qf = try m.buf(n * 4096 * 4);
++    try m.proj(ix.q, qr, m.c.q_rank, qf, n);
++    const q = try m.buf(n * 4096 * 2);
++    try k.castRows(m.s, qf, 4096, q, 4096, n, 4096);
++    try m.k.mla.rope(m.s, .{ .x = q + 64 * 2, .x_row = 4096, .x_head = 128, .out = q + 64 * 2, .o_row = 4096, .o_head = 128 }, n, 32, pos, inv_freq, 1.0);
++    const w = try m.buf(n * 32 * 4);
++    try m.proj(ix.hw, x, m.c.hidden, w, n);
++    const scores = try m.buf(n * nk * 4);
++    try k.dsaScores(m.s, q, w, ix.k_cache, pos, scores, n, nk, 1.0 / @sqrt(32.0 * 128.0));
++    try k.dsaSelect(m.s, scores, tok, cnt, n, nk, pos, m.c.index_topk);
++    if (m.snap) |*sn| for (sn.layers[0..sn.n], 0..) |li, j| if (li == m.at_layer) try snapshot(m, sn, j, tok, cnt, n);
++}
+diff --git a/zig/src/families/hy4_flash/native.zig b/zig/src/families/hy4_flash/native.zig
+index 68defae..c087165 100644
+--- a/zig/src/families/hy4_flash/native.zig
++++ b/zig/src/families/hy4_flash/native.zig
+@@ -151,3 +151,41 @@ fn release(p: *anyopaque) void {
+     own.setup.deinit(own.gpa);
+     own.gpa.destroy(own);
+ }
++
++pub const v4 = struct {
++    pub const model_type = "hy_v4_vl";
++    pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed" };
++    pub const default_context: i64 = 32768;
++    pub const max_segments: u32 = 1;
++    pub const prompt_rows: u32 = engine.max_step_rows;
++    pub const snap_lookahead: u32 = 0;
++    pub const takes_drafter = false;
++    pub const drafter_refusal = "--drafter: Hy4 drafts with the checkpoint's own DFly layers; serve it without --drafter";
++    pub const explains_open = true;
++    pub const window_rows: u32 = serve.max_window;
++    pub const Room = @import("native.zig").Room;
++    pub const Options = @import("native.zig").Options;
++    pub const Loaded = @import("native.zig").Loaded;
++    pub const placementWeightBytes = @import("native.zig").placementWeightBytes;
++    pub const open = @import("native.zig").open;
++    pub const explain = @import("native.zig").explain;
++};
++
++pub const v4_text = struct {
++    pub const model_type = "hy_v4";
++    pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed" };
++    pub const default_context: i64 = 32768;
++    pub const max_segments: u32 = 1;
++    pub const prompt_rows: u32 = engine.max_step_rows;
++    pub const snap_lookahead: u32 = 0;
++    pub const takes_drafter = false;
++    pub const drafter_refusal = "--drafter: Hy4 drafts with the checkpoint's own DFly layers; serve it without --drafter";
++    pub const explains_open = true;
++    pub const window_rows: u32 = serve.max_window;
++    pub const Room = @import("native.zig").Room;
++    pub const Options = @import("native.zig").Options;
++    pub const Loaded = @import("native.zig").Loaded;
++    pub const placementWeightBytes = @import("native.zig").placementWeightBytes;
++    pub const open = @import("native.zig").open;
++    pub const explain = @import("native.zig").explain;
++};
+diff --git a/zig/src/families/hy4_flash/serve.zig b/zig/src/families/hy4_flash/serve.zig
+index 9909c93..08f70a3 100644
+--- a/zig/src/families/hy4_flash/serve.zig
++++ b/zig/src/families/hy4_flash/serve.zig
+@@ -27,47 +27,51 @@ pub const Link = struct {
+     g: *const cuda.tp_group.Group,
+     d: *const cuda.Driver,
+     buf: cuda.DeviceBuffer,
++    all: cuda.DeviceBuffer,
+     ids: []i32,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *const cuda.tp_group.Group, context: usize) !Link {
+-        var buf = try cuda.DeviceBuffer.alloc(d, @sizeOf(Header) + context * 4);
++        const cap = @sizeOf(Header) + context * 4;
++        var buf = try cuda.DeviceBuffer.alloc(d, cap);
+         errdefer buf.free();
+-        return .{ .g = g, .d = d, .buf = buf, .ids = try gpa.alloc(i32, context) };
++        var all = try cuda.DeviceBuffer.alloc(d, cap * g.world);
++        errdefer all.free();
++        return .{ .g = g, .d = d, .buf = buf, .all = all, .ids = try gpa.alloc(i32, context) };
+     }
+ 
+     pub fn deinit(l: *Link, gpa: std.mem.Allocator) void {
++        l.all.free();
+         l.buf.free();
+         gpa.free(l.ids);
+     }
+ 
+-    /// Rank 0: the call to every other rank, before it runs it; the buffer is free again on return.
++    /// Rank 0: broadcast call via Ring-safe allGather (no cross-ring point-to-point send/recv).
+     pub fn send(l: *Link, s: cuda.Stream, h: Header, ids: []const i32) !void {
+         try l.put(s, 0, std.mem.asBytes(&h));
+-        if (ids.len > 0) try l.put(s, @sizeOf(Header), std.mem.sliceAsBytes(ids));
+-        for (1..l.g.world) |peer| {
+-            try l.g.send(s, l.buf.ptr, @sizeOf(Header), peer);
+-            if (ids.len > 0) try l.g.send(s, l.buf.ptr + @sizeOf(Header), ids.len * 4, peer);
++        try l.g.allGather(s, l.buf.ptr, l.all.ptr, @sizeOf(Header));
++        if (ids.len > 0) {
++            try l.put(s, 0, std.mem.sliceAsBytes(ids));
++            try l.g.allGather(s, l.buf.ptr, l.all.ptr, ids.len * 4);
+         }
+         try s.synchronize();
+     }
+ 
+-    /// Host bytes into the buffer on `s`, ordered before the sends that read them.
+     fn put(l: *Link, s: cuda.Stream, at: usize, bytes: []const u8) !void {
+         try l.d.check(l.d.api.cuMemcpyHtoDAsync_v2(l.buf.ptr + at, bytes.ptr, bytes.len, s.handle), "cuMemcpyHtoDAsync");
+     }
+ 
+-    /// Another rank: rank 0's next call and its ids.
++    /// Another rank: receive rank 0's next call and its ids via Ring-safe allGather.
+     pub fn receive(l: *Link, s: cuda.Stream) !struct { h: Header, ids: []const i32 } {
+         var h: Header = undefined;
+-        try l.g.recv(s, l.buf.ptr, @sizeOf(Header), 0);
++        try l.g.allGather(s, l.buf.ptr, l.all.ptr, @sizeOf(Header));
+         try s.synchronize();
+-        try l.buf.download(0, std.mem.asBytes(&h));
++        try l.all.download(0, std.mem.asBytes(&h));
+         if (h.kind < @intFromEnum(Kind.clear) or h.kind > @intFromEnum(Kind.end)) return error.BadCall;
+         if (h.n > l.ids.len) return error.CallTooWide;
+         if (h.n > 0) {
+-            try l.g.recv(s, l.buf.ptr + @sizeOf(Header), h.n * 4, 0);
++            try l.g.allGather(s, l.buf.ptr, l.all.ptr, h.n * 4);
+             try s.synchronize();
+-            try l.buf.download(@sizeOf(Header), std.mem.sliceAsBytes(l.ids[0..h.n]));
++            try l.all.download(0, std.mem.sliceAsBytes(l.ids[0..h.n]));
+         }
+         return .{ .h = h, .ids = l.ids[0..h.n] };
+     }
+diff --git a/zig/src/families/hy4_flash/weights.zig b/zig/src/families/hy4_flash/weights.zig
+index b6eafae..f6743f5 100644
+--- a/zig/src/families/hy4_flash/weights.zig
++++ b/zig/src/families/hy4_flash/weights.zig
+@@ -17,10 +17,11 @@ pub const Lin = cuda.qmmf.Weight;
+ /// Per head on the tensor cores for prompt passes: wk transposed [512][192] (absorb), wv [256][512] (expand).
+ pub const max_heads = 64;
+ pub const HeadLins = struct { wk: [max_heads]Lin = undefined, wv: [max_heads]Lin = undefined };
+-pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, lins: HeadLins, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool, idx: ?Indexer = null };
++pub const DsaIndexer = struct { q: Lin, hw: Lin, wk: Lin, k_norm_w: u64, k_norm_b: u64, k_cache: u64 };
++pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, lins: HeadLins, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool, idx: ?Indexer = null, dsa_idx: ?DsaIndexer = null };
+ /// A sparse layer's compressed indexer (replicated on every rank) and its caches: token keys, pooled group keys.
+ pub const Indexer = struct { q: Lin, hw: Lin, tk: Lin, tk_norm: u64, wv: u64, wg: u64, ape: u64, k_norm: u64, tk_cache: u64, gk_cache: u64 };
+-pub const Moe = struct { router: Lin, bias: u64, down: Lin, up: Lin, routed: cuda.experts.Layer, shared: cuda.experts.Layer, norm: u64 };
++pub const Moe = struct { router: Lin, bias: u64, down: ?Lin, up: ?Lin, routed: cuda.experts.Layer, shared: cuda.experts.Layer, norm: u64 };
+ pub const Mlp = union(enum) { dense: struct { t: cuda.experts.Layer, norm: u64 }, moe: Moe };
+ /// proj: the four key projections and the value projection as one weight, rows [k0 k1 k2 k3 v]; bias likewise.
+ pub const Engram = struct { ids: []align(1) const i32, hash: u64, offsets: u64, moduli: [engram.heads]u32, mult: [engram.max_ngram]u64, table: hy4.EngramTable, row_norm: u64, proj: Lin, bias: u64, mix: hy4.EngramMix };
+@@ -89,6 +90,13 @@ pub const Loader = struct {
+         return l.lin(t.bytes, t.dim(0), t.dim(1));
+     }
+ 
++    pub fn wOpt(l: Loader, comptime fmt: []const u8, args: anytype) !u64 {
++        var buf: [200]u8 = undefined;
++        const name = try std.fmt.bufPrint(&buf, fmt, args);
++        const t = l.ck.get(name) catch return 0;
++        return l.up(t.bytes);
++    }
++
+     pub fn tensor(l: Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+         var buf: [200]u8 = undefined;
+         return l.ck.get(try std.fmt.bufPrint(&buf, fmt, args));
+@@ -206,7 +214,7 @@ pub fn loadAttn(l: Loader, comptime a: []const u8, args: anytype, H_all: usize,
+     const st = try l.tensor(a ++ "learnable_sink_param", args); // fp32 in the target, bf16 in DFly
+     var sink: [128]f32 = undefined;
+     for (0..H) |h| sink[h] = if (st.dtype == .f32) std.mem.bytesAsValue(f32, st.bytes[(h0 + h) * 4 ..][0..4]).* else @bitCast(@as(u32, std.mem.readInt(u16, st.bytes[(h0 + h) * 2 ..][0..2], .little)) << 16);
+-    return .{ .q_a = try l.linQOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.linQ((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linQOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .lins = lins, .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.linQ((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.linQ(o, hd, H * 256), .post_norm = try l.w(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
++    return .{ .q_a = try l.linQOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.linQ((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linQOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .lins = lins, .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.linQ((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.linQ(o, hd, H * 256), .post_norm = try l.wOpt(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
+ }
+ 
+ pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, engram_here: bool) !Layer {
+@@ -214,20 +222,22 @@ pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32,
+     const sliding = c.kinds[i] == .sliding;
+     const H_all: usize = c.heads(@intCast(i)).q;
+     var attn = try loadAttn(l, p ++ "self_attn.", .{i}, H_all, sliding, c.q_rank, c.hidden);
+-    if (!sliding) attn.idx = try loadIndexer(l, i);
++    if (c.is_v4) {
++        if (c.indexer_full[i]) attn.dsa_idx = try loadDsaIndexer(l, i);
++    } else if (!sliding) attn.idx = try loadIndexer(l, i);
+     const hd: usize = c.hidden;
+     const mp = p ++ "mlp.";
+     const di = c.dense_inter / l.world;
+     const si = c.expert_inter * c.shared / l.world;
+     const eo = c.experts / l.world;
+-    const mlp_: Mlp = if (!c.moe[i]) .{ .dense = .{ .t = try l.experts(mp, .{i}, true, 0, 1, c.dense_inter, l.rank * di, di, hd, 0), .norm = try l.w(mp ++ "post_fc2_norm.weight", .{i}) } } else .{ .moe = .{
++    const mlp_: Mlp = if (!c.moe[i]) .{ .dense = .{ .t = try l.experts(mp, .{i}, true, 0, 1, c.dense_inter, l.rank * di, di, hd, 0), .norm = if (c.is_v4) 0 else try l.w(mp ++ "post_fc2_norm.weight", .{i}) } } else .{ .moe = .{
+         .router = try l.linOf(mp ++ "gate.weight", .{i}),
+         .bias = try l.w(mp ++ "gate.e_score_correction_bias", .{i}),
+-        .down = try l.linQOf(mp ++ "routed_expert_down_proj.weight", .{i}),
+-        .up = try l.linQOf(mp ++ "routed_expert_up_proj.weight", .{i}),
+-        .routed = try l.experts(mp ++ "experts.", .{i}, false, l.rank * eo, eo, c.expert_inter, 0, c.expert_inter, c.latent, c.swiglu_limit),
++        .down = if (c.is_v4) null else try l.linQOf(mp ++ "routed_expert_down_proj.weight", .{i}),
++        .up = if (c.is_v4) null else try l.linQOf(mp ++ "routed_expert_up_proj.weight", .{i}),
++        .routed = try l.experts(mp ++ "experts.", .{i}, false, l.rank * eo, eo, c.expert_inter, 0, c.expert_inter, if (c.is_v4) hd else c.latent, c.swiglu_limit),
+         .shared = try l.experts(mp ++ "shared_experts.", .{i}, true, 0, 1, c.expert_inter * c.shared, l.rank * si, si, hd, 0),
+-        .norm = try l.w(mp ++ "combine_output_norm.weight", .{i}),
++        .norm = if (c.is_v4) 0 else try l.w(mp ++ "combine_output_norm.weight", .{i}),
+     } };
+     return .{ .attn = attn, .hc_attn = try l.hc(p ++ "hc_attn_layer.hc_pre.hc", .{i}), .hc_ffn = try l.hc(p ++ "hc_mlp_layer.hc_pre.hc", .{i}), .in_norm = try l.w(p ++ "input_layernorm.weight", .{i}), .post_norm = try l.w(p ++ "post_attention_layernorm.weight", .{i}), .mlp = mlp_, .engram = if (engram_here) try loadEngram(l, i, heads) else null };
+ }
+@@ -285,3 +295,15 @@ fn loadIndexer(l: Loader, i: usize) !Indexer {
+         .gk_cache = try l.zeros(l.context / 4 * 128 * 2),
+     };
+ }
++
++fn loadDsaIndexer(l: Loader, i: usize) !DsaIndexer {
++    const p = "model.layers.{d}.self_attn.indexer.";
++    return .{
++        .q = try l.linOf(p ++ "wq_b.weight", .{i}),
++        .hw = try l.linOf(p ++ "weights_proj.weight", .{i}),
++        .wk = try l.linOf(p ++ "wk.weight", .{i}),
++        .k_norm_w = try l.w(p ++ "k_norm.weight", .{i}),
++        .k_norm_b = try l.w(p ++ "k_norm.bias", .{i}),
++        .k_cache = try l.zeros(l.context * 128 * 2),
++    };
++}
+diff --git a/zig/src/native/cuda_families.zig b/zig/src/native/cuda_families.zig
+index 9819d95..013a66d 100644
+--- a/zig/src/native/cuda_families.zig
++++ b/zig/src/native/cuda_families.zig
+@@ -15,7 +15,7 @@ const dory = @import("dory");
+ const qwen3 = @import("qwen3_cuda");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, hy4_flash.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("lfm2_moe_cuda").native };
++pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, hy4_flash.native, hy4_flash.native_v4, hy4_flash.native_v4_text, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("lfm2_moe_cuda").native };
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len + 5]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };
