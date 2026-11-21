@@ -416,7 +416,7 @@ index 237c9f4..1a961d0 100644
  
  const Layer = struct { attn: engine.Attn, in_norm: u64, post_norm: u64, gate_up: Lin, down: Lin, inter: usize, kv: usize };
 diff --git a/zig/src/families/hy4_flash/engine.zig b/zig/src/families/hy4_flash/engine.zig
-index cc06f8f..f0c0b01 100644
+index cc06f8f..734e627 100644
 --- a/zig/src/families/hy4_flash/engine.zig
 +++ b/zig/src/families/hy4_flash/engine.zig
 @@ -15,7 +15,7 @@ pub const row_width = 576;
@@ -510,17 +510,19 @@ index cc06f8f..f0c0b01 100644
          const nch: usize = if (list) |li| (li.w + 511) / 512 else if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
          const part: cuda.mla.Partials = .{ .po = try m.zeros(nch * n * H * 512 * 4), .pm = try m.zeros(nch * n * H * 4), .pl = try m.zeros(nch * n * H * 4) };
          const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sparse.nope + c.sparse.rope)));
-@@ -489,6 +500,9 @@ pub const Model = struct {
+@@ -489,6 +500,11 @@ pub const Model = struct {
              const cnt = try m.buf(n * 4);
              try k.window(m.s, pos, tok, cnt, n, win);
              try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, tok, cnt, win, part, n, H, scale);
 +        } else if (dsa_indexed) {
-+            if (a.dsa_idx) |ix| try index.dsaRecalled(m, ix, x, qr, pos, a.inv_freq, keys, n, m.shared_tok, m.shared_cnt);
++            const dsa_nk = @min(((keys + 511) / 512) * 512, m.context);
++            if (a.dsa_idx) |ix| try index.dsaRecalled(m, ix, x, qr, pos, a.inv_freq, dsa_nk, n, m.shared_tok, m.shared_cnt);
++            if (a.dsa_idx == null) if (m.snap) |*sn| for (sn.layers[0..sn.n], 0..) |li, j| if (li == m.at_layer) try index.snapshot(m, sn, j, m.shared_tok, m.shared_cnt, n);
 +            try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, m.shared_tok, m.shared_cnt, recall, part, n, H, scale);
          } else if (indexed) {
              const tok = try m.buf(n * recall * 4);
              const cnt = try m.buf(n * 4);
-@@ -509,7 +523,7 @@ pub const Model = struct {
+@@ -509,7 +525,7 @@ pub const Model = struct {
          try m.proj(a.o, o, H * 256, po, n);
          try m.sum(po, n * hd);
          const out = try m.buf(n * hd * 2);
@@ -529,7 +531,7 @@ index cc06f8f..f0c0b01 100644
          return out;
      }
  
-@@ -518,7 +532,8 @@ pub const Model = struct {
+@@ -518,7 +534,8 @@ pub const Model = struct {
          var t = t_;
          if (skip >= 0) t.experts += 1; // the other ranks' picks, planned as one more expert and skipped
          const pairs = n * per;
@@ -539,7 +541,7 @@ index cc06f8f..f0c0b01 100644
          const items = cuda.grouped.maxItems(pairs, t.experts, tile);
          const wide = pairs > cuda.grouped.small;
          const plan: cuda.grouped.Plan = .{ .members = try m.zeros(pairs * 4), .items = try m.zeros(items * 12), .counts = try m.zeros(8), .rank = try m.zeros((if (wide) pairs else 1) * 4), .hist = try m.zeros((if (wide) (pairs + 1023) / 1024 * t.experts else 1) * 4) };
-@@ -526,8 +541,13 @@ pub const Model = struct {
+@@ -526,8 +543,13 @@ pub const Model = struct {
          const act = try m.buf(pairs * t.width * 2);
          const y = try m.zeros(pairs * t.dims * 2);
          const g: cuda.experts.Grouped = .{ .nvfp4 = &m.k.x };
@@ -555,7 +557,7 @@ index cc06f8f..f0c0b01 100644
          const out = try m.buf(n * t.dims * 2);
          try m.k.glue.combine(m.s, y, .bf16, wts, out, .bf16, n, per, t.dims);
          return out;
-@@ -547,7 +567,7 @@ pub const Model = struct {
+@@ -547,7 +569,7 @@ pub const Model = struct {
                  const y = try m.zeros(n * hd * 4);
                  try m.k.k.addb(m.s, y, try m.one(dm.t, x, n), n * hd);
                  try m.sum(y, n * hd);
@@ -564,7 +566,7 @@ index cc06f8f..f0c0b01 100644
              },
              .moe => |e| {
                  const E: usize = c.experts;
-@@ -558,18 +578,23 @@ pub const Model = struct {
+@@ -558,18 +580,23 @@ pub const Model = struct {
                  const picks = try m.buf(n * K * 4);
                  const wts = try m.buf(n * K * 4);
                  try m.k.glue.topk(m.s, logits, e.bias, .{ .experts = E, .topk = K, .shared = false, .normalize = true, .scale = c.route_scale, .score = true }, picks, wts, n);
@@ -617,9 +619,18 @@ index 4bd2785..e9742c9 100644
          for (kv.array.items, 0..) |v, i| s.kv[i] = @intCast(v.integer);
          s.n_kv = kv.array.items.len;
 diff --git a/zig/src/families/hy4_flash/index.zig b/zig/src/families/hy4_flash/index.zig
-index c639d7c..9a6920e 100644
+index c639d7c..61510a3 100644
 --- a/zig/src/families/hy4_flash/index.zig
 +++ b/zig/src/families/hy4_flash/index.zig
+@@ -40,7 +40,7 @@ pub fn recalled(m: *Model, ix: wt.Indexer, x: u64, qr: u64, pos: u64, inv_freq:
+ }
+ 
+ /// Draft layer j's target lists into the snapshot: a block's rows into slots 0.., a prompt's last row into slot 0.
+-fn snapshot(m: *Model, sn: *engine.Snap, j: usize, tok: u64, cnt: u64, n: usize) !void {
++pub fn snapshot(m: *Model, sn: *engine.Snap, j: usize, tok: u64, cnt: u64, n: usize) !void {
+     const first = if (n <= engine.verify_rows) 0 else n - 1;
+     const take = if (n <= engine.verify_rows) n else 1;
+     const dt: cuda.DeviceBuffer = .{ .d = m.d, .ptr = sn.tok + j * engine.verify_rows * 2048 * 4, .len = take * 2048 * 4, .borrowed = true };
 @@ -48,3 +48,30 @@ fn snapshot(m: *Model, sn: *engine.Snap, j: usize, tok: u64, cnt: u64, n: usize)
      const dc: cuda.DeviceBuffer = .{ .d = m.d, .ptr = sn.cnt + j * engine.verify_rows * 4, .len = take * 4, .borrowed = true };
      try dc.copyFrom(0, cnt + first * 4, take * 4, m.s.handle);
